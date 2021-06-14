@@ -1,0 +1,32 @@
+---
+title: "HouseValueProject"
+author: "Marco Zuñiga"
+date: "6/14/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# House Value Project
+
+```{r packages, message=FALSE}
+library("readr")
+library("dplyr")
+library("ggplot2")
+library("kableExtra")
+library("reshape2")
+library("caret")
+library("car")
+library("gridExtra")
+```
+
+## Including Plots
+
+
+
+```{r Import Data, include=FALSE}
+
+```
+
