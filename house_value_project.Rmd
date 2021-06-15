@@ -12,7 +12,7 @@ knitr::opts_chunk$set(echo = TRUE)
 # House Value Project
 
 ```{r packages, message=FALSE}
-library("readr")
+library("data.table")
 library("dplyr")
 library("ggplot2")
 library("kableExtra")
@@ -21,12 +21,456 @@ library("caret")
 library("car")
 library("gridExtra")
 ```
+```{r, Auxiliary Functions}
 
-## Including Plots
+```
+
+
+## EDA
 
 
 
 ```{r Import Data, include=FALSE}
+house_df <- read_csv("data/train.csv")
+house_df <- house_df %>% select(-c("id"))
+
+house_df_test <- read_csv("data/test.csv")
+house_df_test_ids <- house_df_test[,"id"]
+house_df_test <- house_df_test %>% select(-c("id","longitude", "latitude"))
+```
+```{r Show Data,echo = FALSE}
+glimpse(house_df)
+```
+```{r EDA ,echo = FALSE}
+summary(house_df)
+
+```
+```{r Correct Types}
+
+house_df <- house_df %>% 
+  mutate(ocean_proximity = as.factor(ocean_proximity))
+
+house_df_test <-  house_df_test %>% 
+  mutate(ocean_proximity = as.factor(ocean_proximity))
+
+
+summary(house_df$ocean_proximity)
+```
+
+```{r}
+plotAllvsY <- function(df, Y) {
+  cols <- colnames(df)[-Y]
+  Y.var <- colnames(df)[Y]
+  res <- lapply(cols, function(col) eval(parse(text=paste0("ggplot(df, aes(x=",col,", y=",Y.var,")) + geom_point()"))))
+  res
+}
+Y <- which(colnames(house_df)=="median_house_value")
+print(Y)
+plotAllvsY(house_df, Y)
+
 
 ```
 
+```{r, NAs in Data}
+
+colsNA<-colnames(house_df)[!complete.cases(t(house_df))]
+colsNA
+
+
+dataNA<-house_df %>%
+  select(colsNA)
+dataNA
+
+porcentajeNA<-as.data.frame(apply(dataNA, MARGIN = 2, function(col) sum(is.na(col)/length(col))))
+colnames(porcentajeNA)<-c("Porcentaje")
+porcentajeNA
+
+procesables<-porcentajeNA %>%
+  filter(Porcentaje <= 0.05)
+kable(procesables, caption = 'Las variables deben tener menos de un 5% de NAs para poder aplicar procedimientos de imputacion')
+```
+
+```{r, Imputing Data}
+temp <- house_df[,c("total_bedrooms")]
+temp$total_bedrooms_media<-ifelse(is.na(temp$total_bedrooms), 
+                              mean(temp$total_bedrooms, na.rm = TRUE),
+                              temp$total_bedrooms)
+
+temp$total_bedrooms_median<-ifelse(is.na(temp$total_bedrooms), 
+                              median(temp$total_bedrooms, na.rm = TRUE),
+                              temp$total_bedrooms)
+
+temp %>%
+  ggplot(aes(x=total_bedrooms))+
+  geom_density(color="blue", lwd=1)+
+  geom_density(aes(x=total_bedrooms_media), color="red", lwd=1) +
+  geom_density(aes(x=total_bedrooms_median), color="purple", lwd=1) +
+  theme_minimal()
+
+dataTemp <- melt(temp)
+dataTemp %>% 
+  ggplot(aes(x=variable, y=value))+
+  geom_boxplot()
+
+house_df$total_bedrooms <- temp$total_bedrooms_media
+
+house_df_test$total_bedrooms <- ifelse(is.na(house_df_test$total_bedrooms), 
+                              mean(house_df_test$total_bedrooms, na.rm = TRUE),
+                              house_df_test$total_bedrooms)
+
+```
+
+```{r, Codificacion Variables Categoricas}
+categorical_cols <- colnames(house_df)[sapply(house_df, is.factor)]
+categorical_cols
+
+dataset <- house_df %>%
+                select(all_of(categorical_cols))
+
+sapply(dataset,levels)
+
+apply(dataset, 2, table)
+
+# El valor Island es candidato a eliminarse en OHE K-1
+
+OHE <- dummyVars("~.", data = dataset)
+OHE_dataframe<-data.frame(predict(OHE, newdata = dataset))
+house_df <- cbind(OHE_dataframe, house_df) %>%
+  select(-c("ocean_proximity", "ocean_proximity.ISLAND"))
+
+dataset <- house_df_test %>%
+                select(all_of(categorical_cols))
+
+OHE <- dummyVars("~.", data = dataset)
+OHE_dataframe<-data.frame(predict(OHE, newdata = dataset))
+house_df_test <- cbind(OHE_dataframe, house_df_test) %>%
+  select(-c("ocean_proximity", "ocean_proximity.ISLAND"))
+```
+
+```{r, Functions to handle outliers}
+detect_outliers <- function(df, colname) {
+  histPlot <- paste("g1<-df %>%
+  ggplot(aes(x =", colname, ")) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()")
+
+  boxPlot <- paste("g2<-df %>% ggplot(aes(y = ", colname, ")) +
+    geom_boxplot()+
+    theme_minimal()")
+  
+  qqPlot <- paste("g3<-df %>% 
+    ggplot(aes(sample = ", colname, ")) + 
+    stat_qq() + stat_qq_line(col='red', lwd=1) +
+    theme_minimal()")
+    
+  plotA<- eval(parse(text=histPlot))
+  plotB<- eval(parse(text=boxPlot))
+  plotC<- eval(parse(text=qqPlot))
+  
+  return(grid.arrange(plotA, plotB, plotC, ncol=2, top=paste("Variable: ", colname)))
+}
+
+treat_outliers <- function(data) {
+  cap_outliers <- function(colname) {
+    calc <- paste("IQR <- quantile(data$", colname, ", 0.75) - quantile(data$",colname,", 0.25)
+    LI <- mean(data$",colname,") - 1.75*IQR
+    LU <- mean(data$",colname,") + 1.75*IQR")
+    
+    capping <- paste("data$",colname," <- ifelse(data$",colname," > LU, LU, data$",colname,")
+                      data$",colname," <- ifelse(data$",colname," < LI, LI, data$",colname,")")
+    
+    eval(parse(text=calc))
+    eval(parse(text=capping))
+    return(eval(parse(text=paste("data$",colname))))
+  }
+  return(cap_outliers)
+}
+
+apply_capping <- function(df, colname){
+  capping <- treat_outliers(df)
+  capped_col <- capping(colname)
+  return(capped_col)
+}
+```
+
+```{r, Detect Outliers}
+
+df <- house_df %>%
+  select(-contains('.'))
+
+x <- sapply(colnames(df), function(col) detect_outliers(df, col))
+```
+
+```{r, Capping Outliers}
+cols <- colnames(df)
+house_df_2 <- as.data.frame(sapply(cols, function(col) apply_capping(df, col)))
+x <- sapply(cols, function(col) detect_outliers(house_df_2, col))
+```
+
+```{r, Variable Transformations}
+transformLog <- function(data){
+  transformed <- log(data)
+  qqPlot(transformed)
+  return(transformed)
+}
+
+transformSQRT <- function(data){
+  transformed <- sqrt(data)
+  qqPlot(transformed)
+  return(transformed)
+}
+
+transformSquare <- function(data){
+  transformed <- data ^ 2
+  qqPlot(transformed)
+  return(transformed)
+}
+
+transformPow <- function(data, pow){
+  transformed <- data ^ pow
+  qqPlot(transformed)
+  return(transformed)
+}
+
+transformInv <- function(data){
+  transformed <- 1 / data
+  qqPlot(transformed)
+  return(transformed)
+}
+
+
+```
+
+```{r, Variable: housing_median_age}
+
+var <- "housing_median_age"
+summary(house_df_2[[var]])
+qqPlot(house_df_2[[var]])
+
+
+house_df_2[[var]] <- transformSQRT(house_df_2[[var]])
+house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+
+qqPlot(house_df_2[[var]])
+
+```
+
+
+```{r, Variable: total_rooms}
+var <- "total_rooms"
+summary(house_df_2[[var]])
+qqPlot(house_df_2[[var]])
+
+
+house_df_2[[var]] <- transformSQRT(house_df_2[[var]])
+house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+
+qqPlot(house_df_2[[var]])
+```
+
+```{r, Variable: total_bedrooms}
+var <- "total_bedrooms"
+summary(house_df_2[[var]])
+qqPlot(house_df_2[[var]])
+
+ggplot(house_df_2, aes(x = total_bedrooms)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+
+house_df_2[[var]] <- transformSQRT(house_df_2[[var]])
+house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+
+
+ggplot(house_df_2, aes(x = total_bedrooms)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+qqPlot(house_df_2[[var]])
+```
+
+```{r, Variable: population}
+var <- "population"
+summary(house_df_2[[var]])
+qqPlot(house_df_2[[var]])
+
+ggplot(house_df_2, aes(x = population)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+
+house_df_2[[var]] <- transformSQRT(house_df_2[[var]])
+house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+
+
+ggplot(house_df_2, aes(x = population)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+qqPlot(house_df_2[[var]])
+```
+
+```{r, Variable: households}
+var <- "households"
+summary(house_df_2[[var]])
+qqPlot(house_df_2[[var]])
+
+ggplot(house_df_2, aes(x = households)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+
+house_df_2[[var]] <- transformSQRT(house_df_2[[var]])
+house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+
+
+ggplot(house_df_2, aes(x = households)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+qqPlot(house_df_2[[var]])
+```
+
+```{r, Variable: median_income}
+var <- "median_income"
+summary(house_df_2[[var]])
+qqPlot(house_df_2[[var]])
+
+ggplot(house_df_2, aes(x = median_income)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+
+house_df_2[[var]] <- transformSQRT(house_df_2[[var]])
+house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+
+
+ggplot(house_df_2, aes(x = median_income)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+qqPlot(house_df_2[[var]])
+```
+
+```{r, Z Scaling}
+zscaling <- function(data) {
+  return((data - mean(data)) / sd(data))
+}
+
+```
+
+
+```{r}
+house_df_2 %>%
+  ggplot() + 
+  geom_density(aes(housing_median_age)) +
+  geom_density(aes(total_rooms)) +
+  geom_density(aes(total_bedrooms)) +
+  geom_density(aes(population)) +
+  geom_density(aes(households)) +
+  geom_density(aes(median_income)) 
+```
+
+```{r, Feature Scaling}
+
+cols <- colnames(house_df_2 %>% select(-contains('.'), -c("longitude",  "latitude", "median_house_value")))
+cols2 <- colnames(house_df_test)
+
+house_df_2[, cols] <- sapply(cols, function(col) zscaling(house_df_2[[col]]))
+house_df_test[, cols2] <- sapply(cols2, function(col) zscaling(house_df_test[[col]]))
+
+house_df_2 %>%
+  ggplot() + 
+  geom_density(aes(housing_median_age)) +
+  geom_density(aes(total_rooms)) +
+  geom_density(aes(total_bedrooms)) +
+  geom_density(aes(population)) +
+  geom_density(aes(households)) +
+  geom_density(aes(median_income)) 
+```
+```{r, Forward Selection Regression}
+kfolds <- function(df, k = 10) {
+  df <- df[sample(1:nrow(df)),] # shuffle dataset
+  n <- nrow(df)
+  foldSize <- n / k
+  getFolds <- function(i, foldSize) {
+    foldIndexInit <- (i * foldSize) + 1
+    foldIndexLimit <- (i + 1) * foldSize
+    index <- c(foldIndexInit: foldIndexLimit)
+    return(list(train=df[-index,], test=df[index,]))
+  }
+  return(lapply(c(0:(k - 1)), function (i) getFolds(i, foldSize)))
+}
+
+validate <- function(data, Y, trainedModel){
+  y.estimate<-predict(object=trainedModel, newdata=data$test)
+  return(sqrt((sum((data$test[, Y] - y.estimate)^2))/nrow(data$test)))
+}
+
+getStrModel <- function(Y, model) { 
+  res <- paste("lm(formula=", Y, "~", model, ", data=data$train)", sep = "")
+  return(res)
+}
+
+crossValidation <- function(dataFolds, Y, strModel){ 
+  sapply(dataFolds, function(data) validate(data, Y, eval(parse(text=strModel))))
+}
+
+
+strModelGen <- function(df, Y, selected){
+  vars <- colnames(df)
+  selectedIndexes <- which(vars  %in% selected)
+  candidateVars <- vars[-c(Y, selectedIndexes)]
+  models <- lapply(candidateVars, function(var) c(selected, var))
+  return(models)
+}
+
+
+modelSelector<-function(df, Y, k = 10){
+  Y.var<-colnames(df)[Y]
+  dataFolds<-kfolds(df, k)
+  continueSearch <- TRUE
+  i <- 1
+  globalMinRMSE <- Inf
+  selected <- c()
+  while(i <= ncol(df[, -Y]) & continueSearch){
+    baseModels<-strModelGen(df, Y, selected)
+    promRMSE <- sapply(baseModels, 
+                       function(model) mean(
+                         crossValidation(dataFolds, Y, 
+                                         getStrModel(Y.var, paste(model, collapse="+")))))
+    # Verificar si alguna Variable mejora el modelo
+    minRMSE<-which.min(promRMSE)
+    
+    if(promRMSE[[minRMSE]] > globalMinRMSE){
+      continueSearch = FALSE 
+    }
+    else {
+      print(list(minRMSE=minRMSE, promRMSE=promRMSE,globalRMSE=globalMinRMSE, lastModel=selected, newModel= baseModels[[minRMSE]]))
+      print("-----------------")
+      globalMinRMSE <- promRMSE[[minRMSE]]
+      selected <- baseModels[[minRMSE]]
+      i <- i + 1
+    }
+  }
+  baseStr<-paste("lm(formula=", Y.var, "~", paste(selected, collapse="+"), ", data=df)")
+  output<-eval(parse(text=baseStr))
+  return(output)
+}
+```
+
+```{r}
+data <- house_df %>% select(contains("."))
+data2 <- house_df_2 %>% select(-c("longitude", "latitude"))
+trainData <- cbind(data, data2)
+model <- modelSelector(trainData, 11)
+```
+```{r}
+summary(model)
+```
+```{r, Predict}
+res <- predict(model, newdata=house_df_test)
+house_df_test$id <- house_df_test_ids$id
+house_df_test$median_house_value <- res
+house_df_test %>% select(id,median_house_value) %>% write_csv(file = "results.csv", append = FALSE, col_names = TRUE)
+```
