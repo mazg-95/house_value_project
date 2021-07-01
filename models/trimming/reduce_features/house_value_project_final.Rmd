@@ -1,0 +1,1373 @@
+---
+title: "house_value_project_final"
+author: "Marco Zuñiga"
+date: "6/27/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# House Value Project
+
+El proposito del siguiente notebook es analizar y crear un modelo de regresion para predecir el valor `median_house_value`. La data utilizada es de un censo aplicado en el estado de California. 
+El Dataset esta dividido por bloque. Y contiene los siguientes atributos: 
+- `Latitude`
+- `Longitud`
+- `housing_median_age`: Contiene la media del grupo de casas de las cuales se obtuvo información.
+- `total_rooms`: Total de habitaciones registrados dentro del bloque.
+- `total_bedroom`s: Total de dormitorios registrados dentro del bloque.
+- `population`: Población total del bloque.
+- `households`: Número total de hogares, un grupo de personas que residen dentro de una unidad de hogar, para un bloque.
+- median_income: Ingreso promedio para hogares dentro de un bloque de casas (medido en decenas de miles de dólares estadounidenses).
+- `median_house_value`: Valor medio de la vivienda para hogares dentro de un bloque (medido en dólares estadounidenses).
+- `ocean_proximity`: Ubicación de la casa respecto del océano/mar.
+
+#### Variation Reduce Features.
+
+```{r packages, message=FALSE}
+library("data.table")
+library("dplyr")
+library("ggplot2")
+library("kableExtra")
+library("reshape2")
+library("caret")
+library("car")
+library("gridExtra")
+library("readr")
+library(PerformanceAnalytics)
+library(BBmisc)
+```
+
+### Utilities
+```{r, Variable Transformations, echo=FALSE}
+transformLog <- function(data){
+  transformed <- log(data)
+  return(transformed)
+}
+
+transformSQRT <- function(data){
+  transformed <- sqrt(data)
+  return(transformed)
+}
+
+transformSquare <- function(data){
+  transformed <- data ^ 2
+  return(transformed)
+}
+
+transformPow <- function(data, pow){
+  transformed <- data ^ pow
+  return(transformed)
+}
+
+transformInv <- function(data){
+  transformed <- 1 / data
+  return(transformed)
+}
+
+
+```
+
+```{r, Functions to handle outliers, echo=FALSE}
+
+trimVar <- function(data, colname){
+  IQR <- quantile(data[[colname]], 0.75) - quantile(data[[colname]], 0.25)
+  LI <- mean(data[[colname]]) - 1.75*IQR
+  LU <- mean(data[[colname]]) + 1.75*IQR
+  mask <- data[colname] < LU & data[colname] > LI
+  return(data[mask,])
+}
+
+detect_outliers <- function(df, colname) {
+  histPlot <- paste("g1<-df %>%
+  ggplot(aes(x =", colname, ")) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()")
+
+  boxPlot <- paste("g2<-df %>% ggplot(aes(y = ", colname, ")) +
+    geom_boxplot()+
+    theme_minimal()")
+  
+  qqPlot <- paste("g3<-df %>% 
+    ggplot(aes(sample = ", colname, ")) + 
+    stat_qq() + stat_qq_line(col='red', lwd=1) +
+    theme_minimal()")
+    
+  plotA<- eval(parse(text=histPlot))
+  plotB<- eval(parse(text=boxPlot))
+  plotC<- eval(parse(text=qqPlot))
+  
+  return(grid.arrange(plotA, plotB, plotC, ncol=2, top=paste("Variable: ", colname)))
+}
+
+treat_outliers <- function(data) {
+  cap_outliers <- function(colname) {
+    calc <- paste("IQR <- quantile(data$", colname, ", 0.75) - quantile(data$",colname,", 0.25)
+    LI <- mean(data$",colname,") - 1.5*IQR
+    LU <- mean(data$",colname,") + 1.5*IQR")
+    
+    capping <- paste("data$",colname," <- ifelse(data$",colname," > LU, LU, data$",colname,")
+                      data$",colname," <- ifelse(data$",colname," < LI, LI, data$",colname,")")
+    
+    eval(parse(text=calc))
+    eval(parse(text=capping))
+    return(eval(parse(text=paste("data$",colname))))
+  }
+  return(cap_outliers)
+}
+
+apply_capping <- function(df, colname){
+  capping <- treat_outliers(df)
+  capped_col <- capping(colname)
+  return(capped_col)
+}
+```
+
+```{r, Forward Selection Regression, echo=FALSE}
+kfolds <- function(df, k = 10) {
+  df <- df[sample(1:nrow(df)),] # shuffle dataset
+  n <- nrow(df)
+  foldSize <- n / k
+  getFolds <- function(i, foldSize) {
+    foldIndexInit <- (i * foldSize) + 1
+    foldIndexLimit <- (i + 1) * foldSize
+    index <- c(foldIndexInit: foldIndexLimit)
+    return(list(train=df[-index,], test=df[index,]))
+  }
+  return(lapply(c(0:(k - 1)), function (i) getFolds(i, foldSize)))
+}
+
+validate <- function(data, Y, trainedModel){
+  y.estimate<-predict(object=trainedModel, newdata=data$test)
+  return(sqrt((sum((data$test[, Y] - y.estimate)^2))/nrow(data$test)))
+}
+
+getStrModel <- function(Y, model) { 
+  res <- paste("lm(formula=", Y, "~", model, ", data=data$train)", sep = "")
+  return(res)
+}
+
+crossValidation <- function(dataFolds, Y, strModel){ 
+  sapply(dataFolds, function(data) validate(data, Y, eval(parse(text=strModel))))
+}
+
+
+strModelGen <- function(df, Y, selected){
+  vars <- colnames(df)
+  selectedIndexes <- which(vars  %in% selected)
+  candidateVars <- vars[-c(Y, selectedIndexes)]
+  models <- lapply(candidateVars, function(var) c(selected, var))
+  return(models)
+}
+
+
+modelSelector<-function(df, Y, k = 10){
+  Y.var<-colnames(df)[Y]
+  dataFolds<-kfolds(df, k)
+  continueSearch <- TRUE
+  i <- 1
+  globalMinRMSE <- Inf
+  selected <- c()
+  while(i <= ncol(df[, -Y]) & continueSearch){
+    baseModels<-strModelGen(df, Y, selected)
+    promRMSE <- sapply(baseModels, 
+                       function(model) mean(
+                         crossValidation(dataFolds, Y, 
+                                         getStrModel(Y.var, paste(model, collapse="+")))))
+    # Verificar si alguna Variable mejora el modelo
+    minRMSE<-which.min(promRMSE)
+    
+    if(promRMSE[[minRMSE]] > globalMinRMSE){
+      continueSearch = FALSE 
+    }
+    else {
+      print(list(minRMSE=minRMSE, promRMSE=promRMSE,globalRMSE=globalMinRMSE, lastModel=selected, newModel= baseModels[[minRMSE]]))
+      print("-----------------")
+      globalMinRMSE <- promRMSE[[minRMSE]]
+      selected <- baseModels[[minRMSE]]
+      i <- i + 1
+    }
+  }
+  baseStr<-paste("lm(formula=", Y.var, "~", paste(selected, collapse="+"), ", data=df)")
+  output<-eval(parse(text=baseStr))
+  return(output)
+}
+```
+
+## EDA
+
+
+### Import Data
+
+```{r Import Data, include=FALSE}
+set.seed(222)
+df <- read_csv("data/train.csv")
+
+### Partition Train/Test
+index<-createDataPartition(df$id, p=0.99, list=FALSE)
+
+house_df <- df %>% select(-c("id"))
+house_df <- house_df[index,]
+house_df_test <- house_df[-index,]
+
+
+### Competition Set
+house_df_comp <- read_csv("data/test.csv")
+
+house_df_comp_ids <- house_df_comp[,"id"]
+house_df_comp <- house_df_comp %>% select(-c("id"))
+
+
+```
+
+
+```{r Show Data,echo = FALSE}
+glimpse(house_df)
+glimpse(house_df_test)
+glimpse(house_df_comp)
+```
+
+```{r}
+summary(house_df)
+summary(house_df_test)
+summary(house_df_comp)
+
+ggplot(house_df, aes(y=median_house_value)) +
+  geom_boxplot()
+  
+```
+
+total_bedrooms: Segun el Summary esta variable tiene algunos NAs.
+
+```{r Correct Types}
+
+house_df <- house_df %>% 
+  mutate(ocean_proximity = as.factor(ocean_proximity))
+
+house_df_test <-  house_df_test %>% 
+  mutate(ocean_proximity = as.factor(ocean_proximity))
+
+house_df_comp <-  house_df_comp %>% 
+  mutate(ocean_proximity = as.factor(ocean_proximity))
+
+
+summary(house_df$ocean_proximity)
+```
+
+```{r}
+ggplot(data = melt(house_df), mapping = aes(x = value)) + 
+    geom_histogram(bins = 30) + facet_wrap(~variable, scales = 'free_x')
+```
+
+- Existe una porcion de casas que aumenta el histograma del medina_house_value justo en 500K, lo que indica que probablemente hay un limite aplicado a esa variable. 
+
+- La escala de las variables varia bastante, es por eso que se aplico un facet_wrap liberando la escala del eje X. Por l que se deberia escalar los valores en el proceso de Feature Engineering. 
+
+- El housing_median_age tambien nos muestra que hay algunos bloques con casas ya envejecidas.
+
+```{r}
+ggplot(data = melt(house_df_test), mapping = aes(x = value)) + 
+    geom_histogram(bins = 30) + facet_wrap(~variable, scales = 'free_x')
+```
+
+```{r}
+ggplot(data = melt(house_df_comp), mapping = aes(x = value)) + 
+    geom_histogram(bins = 30) + facet_wrap(~variable, scales = 'free_x')
+```
+
+```{r}
+plotAllvsY <- function(df, Y) {
+  cols <- colnames(df)[-Y]
+  Y.var <- colnames(df)[Y]
+  lapply(cols, function(col) eval(parse(text=paste0("ggplot(df, aes(x=",col,", y=",Y.var,")) + geom_point()"))))
+}
+Y <- which(colnames(house_df)=="median_house_value")
+plots <- plotAllvsY(house_df, Y)
+
+plots
+```
+
+
+```{r}
+
+ggplot(house_df, aes(x=longitude, y=latitude, color=median_house_value)) +
+  geom_point(alpha=0.6) + scale_color_gradient(low="blue", high="red")
+
+```
+
+```{r}
+house_df %>% select(-contains("ocean_proximity")) %>%
+  chart.Correlation(hist=TRUE)
+
+```
+### Imputing Missing Data 
+
+```{r, Check for Missing Data}
+
+colsNA<-colnames(house_df)[!complete.cases(t(house_df))]
+
+dataNA<-house_df %>%
+  select(colsNA)
+
+porcentajeNA<-as.data.frame(apply(dataNA, MARGIN = 2, function(col) sum(is.na(col)/length(col))))
+colnames(porcentajeNA)<-c("Porcentaje")
+porcentajeNA
+
+```
+
+
+
+```{r, Imputing Data}
+temp <- house_df %>% select(total_bedrooms)
+temp$total_bedrooms_media<-ifelse(is.na(temp$total_bedrooms), 
+                              mean(temp$total_bedrooms, na.rm = TRUE),
+                              temp$total_bedrooms)
+
+temp$total_bedrooms_median<-ifelse(is.na(temp$total_bedrooms), 
+                              median(temp$total_bedrooms, na.rm = TRUE),
+                              temp$total_bedrooms)
+
+temp %>%
+  ggplot(aes(x=total_bedrooms))+
+  geom_density(color="blue", lwd=1)+
+  geom_density(aes(x=total_bedrooms_media), color="red", lwd=1) +
+  geom_density(aes(x=total_bedrooms_median), color="purple", lwd=1) +
+  theme_minimal()
+
+dataTemp <- melt(temp)
+dataTemp %>% 
+  ggplot(aes(x=variable, y=value))+
+  geom_boxplot()
+
+house_df$total_bedrooms <- temp$total_bedrooms_median
+
+house_df_test$total_bedrooms <- ifelse(is.na(house_df_test$total_bedrooms), 
+                              median(house_df_test$total_bedrooms, na.rm = TRUE),
+                              house_df_test$total_bedrooms)
+
+house_df_comp$total_bedrooms <- ifelse(is.na(house_df_comp$total_bedrooms), 
+                              median(house_df_comp$total_bedrooms, na.rm = TRUE),
+                              house_df_comp$total_bedrooms)
+
+```
+
+### New Variables
+
+```{r, Terminos de Interaccion}
+ house_df <- house_df %>%
+   mutate(
+     bedrooms_rooms_ratio = total_bedrooms / total_rooms, 
+     bedrooms_per_household = total_bedrooms / households, 
+     rooms_per_household = total_rooms / households, 
+     pop_per_household = population / households,
+     bedrooms_pop_ratio = total_bedrooms / population, 
+     extra_rooms_ratio = (total_rooms - total_bedrooms)/population
+     )
+ 
+ house_df_test <- house_df_test %>%
+   mutate(
+     bedrooms_rooms_ratio = total_bedrooms / total_rooms, 
+     bedrooms_per_household = total_bedrooms / households, 
+     rooms_per_household = total_rooms / households, 
+     pop_per_household = population / households,
+     bedrooms_pop_ratio = total_bedrooms / population, 
+     extra_rooms_ratio = (total_rooms - total_bedrooms)/population
+     )
+ 
+ 
+  house_df_comp <- house_df_comp %>%
+   mutate(
+     bedrooms_rooms_ratio = total_bedrooms / total_rooms, 
+     bedrooms_per_household = total_bedrooms / households, 
+     rooms_per_household = total_rooms / households, 
+     pop_per_household = population / households,
+     bedrooms_pop_ratio = total_bedrooms / population, 
+     extra_rooms_ratio = (total_rooms - total_bedrooms)/population
+     )
+```
+
+### Correlation
+```{r, Correlation chart New Variables }
+
+house_df %>% select(median_income, bedrooms_rooms_ratio, bedrooms_per_household, rooms_per_household, pop_per_household, bedrooms_pop_ratio, extra_rooms_ratio, median_house_value) %>%
+  chart.Correlation(hist=TRUE)
+```
+
+```{r, Correlation}
+correlation <- house_df %>% select(-ocean_proximity) %>% cor(y =house_df$median_house_value)
+rows_n <- rownames(correlation)
+corr_df <- data.frame(Correlation=correlation, row.names = rows_n)
+corr_df %>% arrange(desc(abs(Correlation)))
+```
+
+
+
+De los terminos derivados podemos observar que `extra_rooms_ratio` esta mas correlacion con el valor de la casa que las variables de las que se deriva. Esto tiene sentido al considerar que casas con mas cuartos que no son solo cuartos para dormir podrian considerarse como cuartos de entretenimiento o estudios. Extras que harian que una casa aunmentase su valor. Este termino de interaccion mejor incluso la correlacion de cuartos por hogar `rooms_per_household` y la proporcion de dormitorios por cuartos en el bloque  `bedrooms_rooms_ratio`.
+
+### Categorical Variables - OHE K-1
+
+```{r}
+categorical_cols <- colnames(house_df)[sapply(house_df, is.factor)]
+categorical_cols
+
+dataset <- house_df %>%
+                select(all_of(categorical_cols))
+
+sapply(dataset,levels)
+
+apply(dataset, 2, table)
+```
+
+Vemos que la clase Island tiene una poca frecuencia. Por ello aplicamos OHE K-1 removiendo esta clase.
+
+```{r, Codificacion Variables Categoricas}
+dataset <- house_df %>%
+                select(all_of(categorical_cols))
+# El valor Island es candidato a eliminarse en OHE K-1
+OHE <- dummyVars("~.", data = dataset)
+OHE_dataframe<-data.frame(predict(OHE, newdata = dataset))
+house_df <- cbind(OHE_dataframe, house_df) %>%
+  select(-c("ocean_proximity", "ocean_proximity.ISLAND"))
+
+dataset <- house_df_test %>%
+                select(all_of(categorical_cols))
+
+OHE_dataframe<-data.frame(predict(OHE, newdata = dataset))
+house_df_test <- cbind(OHE_dataframe, house_df_test) %>%
+  select(-c("ocean_proximity", "ocean_proximity.ISLAND"))
+
+dataset <- house_df_comp %>%
+                select(all_of(categorical_cols))
+
+
+OHE_dataframe<-data.frame(predict(OHE, newdata = dataset))
+house_df_comp <- cbind(OHE_dataframe, house_df_comp) %>%
+  select(-c("ocean_proximity", "ocean_proximity.ISLAND"))
+```
+
+
+## Treat Outlieers
+
+```{r, Detect Outliers}
+
+df <- house_df %>%
+  select(-contains('.'))
+
+cols <- colnames(df)
+
+x <- sapply(cols, function(col) detect_outliers(df, col))
+```
+
+```{r, Capping Outliers}
+# house_df[, cols] <- as.data.frame(sapply(cols, function(col) apply_capping(df, col)))
+# x <- sapply(cols, function(col) detect_outliers(house_df, col))
+```
+
+
+```{r, Trimming Outliers}
+
+
+house_df <- house_df %>%
+  trimVar("median_house_value")#%>%
+  # trimVar("housing_median_age") %>%
+  # trimVar("total_rooms") %>%
+  # trimVar("total_bedrooms")  %>%
+  # trimVar("population") %>%
+  # trimVar("households") %>%
+  # trimVar("median_income") %>%
+  # trimVar("bedrooms_rooms_ratio") %>%
+  # trimVar("pop_per_household") %>%
+  # trimVar("bedrooms_per_household") %>%
+  # trimVar("rooms_per_household") %>%
+  # trimVar("bedrooms_pop_ratio") %>%
+  # trimVar("extra_rooms_ratio")
+
+
+
+
+x <- sapply(cols, function(col) detect_outliers(house_df, col))
+```
+
+### Variable Transformation
+
+```{r, Variable: housing_median_age}
+
+var <- "housing_median_age"
+summary(house_df[[var]])
+qqPlot(house_df[[var]])
+
+
+house_df[[var]] <- transformSQRT(house_df[[var]])
+house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+house_df_comp[[var]] <- transformSQRT(house_df_comp[[var]])
+# qqPlot(t)
+qqPlot(house_df[[var]])
+
+```
+
+
+```{r, Variable: total_rooms}
+var <- "total_rooms"
+summary(house_df[[var]])
+qqPlot(house_df[[var]])
+
+house_df[[var]] <- transformSQRT(house_df[[var]])
+house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+house_df_comp[[var]] <- transformSQRT(house_df_comp[[var]])
+
+qqPlot(house_df[[var]])
+```
+```{r, Variable: total_bedrooms}
+var <- "total_bedrooms"
+summary(house_df[[var]])
+qqPlot(house_df[[var]])
+
+ggplot(house_df, aes(x = total_bedrooms)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+house_df[[var]] <- transformSQRT(house_df[[var]])
+house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+house_df_comp[[var]] <- transformSQRT(house_df_comp[[var]])
+
+
+ggplot(house_df, aes(x = total_bedrooms)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+qqPlot(house_df[[var]])
+```
+
+```{r, Variable: population}
+var <- "population"
+summary(house_df[[var]])
+qqPlot(house_df[[var]])
+
+ggplot(house_df, aes(x = population)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+
+house_df[[var]] <- transformLog(house_df[[var]])
+house_df_test[[var]] <- transformLog(house_df_test[[var]])
+house_df_comp[[var]] <- transformLog(house_df_comp[[var]])
+
+
+ggplot(house_df, aes(x = population)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+qqPlot(house_df[[var]])
+```
+
+```{r, Variable: households}
+var <- "households"
+summary(house_df[[var]])
+qqPlot(house_df[[var]])
+
+ggplot(house_df, aes(x = households)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+
+house_df[[var]] <- transformSQRT(house_df[[var]])
+house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+house_df_comp[[var]] <- transformSQRT(house_df_comp[[var]])
+
+
+ggplot(house_df, aes(x = households)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+qqPlot(house_df[[var]])
+```
+
+```{r, Variable: median_income}
+var <- "median_income"
+summary(house_df[[var]])
+qqPlot(house_df[[var]])
+
+ggplot(house_df, aes(x = median_income)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+
+
+house_df[[var]] <- transformSQRT(house_df[[var]])
+house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+house_df_comp[[var]] <- transformSQRT(house_df_comp[[var]])
+
+
+ggplot(house_df, aes(x = median_income)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+qqPlot(house_df[[var]])
+```
+
+
+```{r, Variable: bedrooms_rooms_ratio }
+ var <- "bedrooms_rooms_ratio"
+ summary(house_df[[var]])
+ qqPlot(house_df[[var]])
+ 
+ ggplot(house_df, aes(x = bedrooms_rooms_ratio)) +
+   geom_histogram(color='white', fill='blue') +
+   theme_minimal()
+ 
+
+ house_df[[var]] <- transformLog(house_df[[var]])
+ house_df_test[[var]] <- transformLog(house_df_test[[var]])
+ house_df_comp[[var]] <- transformLog(house_df_comp[[var]])
+ 
+ 
+ 
+ ggplot(house_df, aes(x = bedrooms_rooms_ratio)) +
+   geom_histogram(color='white', fill='blue') +
+   theme_minimal()
+ 
+ qqPlot(house_df[[var]])
+```
+
+# ```{r, Variable: bedrooms_per_household }
+# var <- "bedrooms_per_household"
+# summary(house_df[[var]])
+# qqPlot(house_df[[var]])
+# 
+# ggplot(house_df, aes(x = bedrooms_per_household)) +
+#   geom_histogram(color='white', fill='blue') +
+#   theme_minimal()
+# 
+# # house_df[[var]] <- transformLog(house_df[[var]])
+# # house_df_test[[var]] <- transformLog(house_df_test[[var]])
+# # house_df_comp[[var]] <- transformLog(house_df_comp[[var]])
+# 
+# 
+# ggplot(house_df, aes(x = bedrooms_per_household)) +
+#   geom_histogram(color='white', fill='blue') +
+#   theme_minimal()
+# 
+# qqPlot(house_df[[var]])
+# ```
+
+# ```{r, Variable: rooms_per_household }
+# 
+# var <- "rooms_per_household"
+# summary(house_df[[var]])
+# qqPlot(house_df[[var]])
+# 
+# ggplot(house_df, aes(x = rooms_per_household)) +
+#   geom_histogram(color='white', fill='blue') +
+#   theme_minimal()
+# 
+# 
+# house_df[[var]] <- transformLog(house_df[[var]])
+# house_df_test[[var]] <- transformLog(house_df_test[[var]])
+# house_df_comp[[var]] <- transformLog(house_df_comp[[var]])
+# 
+# ggplot(house_df, aes(x = rooms_per_household)) +
+#   geom_histogram(color='white', fill='blue') +
+#   theme_minimal()
+# 
+# qqPlot(house_df[[var]])
+# ```
+
+
+
+```{r, Variable: pop_per_household }
+var <- "pop_per_household"
+summary(house_df[[var]])
+qqPlot(house_df[[var]])
+
+ggplot(house_df, aes(x = pop_per_household)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+
+
+house_df[[var]] <- transformInv(house_df[[var]])
+house_df_test[[var]] <- transformInv(house_df_test[[var]])
+house_df_comp[[var]] <- transformInv(house_df_comp[[var]])
+
+ggplot(house_df, aes(x = pop_per_household)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+qqPlot(house_df[[var]])
+```
+
+
+
+```{r, Variable: bedrooms_pop_ratio }
+
+var <- "bedrooms_pop_ratio"
+summary(house_df[[var]])
+qqPlot(house_df[[var]])
+
+ggplot(house_df, aes(x = bedrooms_pop_ratio)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+
+house_df[[var]] <- transformInv(house_df[[var]])
+house_df_test[[var]] <- transformInv(house_df_test[[var]])
+house_df_comp[[var]] <- transformInv(house_df_comp[[var]])
+
+ggplot(house_df, aes(x = bedrooms_pop_ratio)) +
+  geom_histogram(color='white', fill='blue') +
+  theme_minimal()
+
+qqPlot(house_df[[var]])
+```
+
+# ```{r, Variable: extra_rooms_ratio }
+# 
+# var <- "extra_rooms_ratio"
+# summary(house_df[[var]])
+# qqPlot(house_df[[var]])
+# 
+# ggplot(house_df, aes(x = extra_rooms_ratio)) +
+#   geom_histogram(color='white', fill='blue') +
+#   theme_minimal()
+# 
+# x <- transformLog(house_df[[var]])
+# qqPlot(x)
+# x <- transformSQRT(house_df[[var]])
+# qqPlot(x)
+# x <- transformSquare(house_df[[var]])
+# qqPlot(x)
+# x <- transformInv(house_df[[var]])
+# qqPlot(x)
+# 
+# # house_df[[var]] <- transformLog(house_df[[var]])
+# # house_df_test[[var]] <- transformSQRT(house_df_test[[var]])
+# 
+# ggplot(house_df, aes(x = extra_rooms_ratio)) +
+#   geom_histogram(color='white', fill='blue') +
+#   theme_minimal()
+# 
+# qqPlot(house_df[[var]])
+# 
+# 
+# ```
+
+# ```{r, Variable: longitude }
+# 
+# var <- "longitude"
+# summary(house_df[[var]])
+# qqPlot(house_df[[var]])
+# 
+# ggplot(house_df, aes(x = longitude)) +
+#   geom_histogram(color='white', fill='blue') +
+#   theme_minimal()
+# 
+# 
+# # x <- transformInv(house_df[[var]])
+# # qqPlot(x)
+# 
+# 
+# house_df[[var]] <- transformInv(house_df[[var]])
+# house_df_test[[var]] <- transformInv(house_df_test[[var]])
+# 
+# ggplot(house_df, aes(x = longitude)) +
+#   geom_histogram(color='white', fill='blue') +
+#   theme_minimal()
+# 
+# qqPlot(house_df[[var]])
+# 
+# 
+# ```
+
+# ```{r, Variable: latitude }
+# 
+# var <- "latitude"
+# summary(house_df[[var]])
+# qqPlot(house_df[[var]])
+# 
+# ggplot(house_df, aes(x = latitude)) +
+#   geom_histogram(color='white', fill='blue') +
+#   theme_minimal()
+# 
+# # x <- transformInv(house_df[[var]])
+# # qqPlot(x)
+# 
+# 
+# house_df[[var]] <- transformInv(house_df[[var]])
+# house_df_test[[var]] <- transformInv(house_df_test[[var]])
+# 
+# ggplot(house_df, aes(x = latitude)) +
+#   geom_histogram(color='white', fill='blue') +
+#   theme_minimal()
+# 
+# qqPlot(house_df[[var]])
+# 
+# 
+# ```
+
+
+## Scaling
+
+```{r}
+house_df %>%
+  ggplot() + 
+  geom_density(aes(housing_median_age)) +
+  geom_density(aes(total_rooms)) +
+  geom_density(aes(total_bedrooms)) +
+  geom_density(aes(population)) +
+  geom_density(aes(households)) +
+  geom_density(aes(median_income)) 
+```
+
+
+
+```{r, Feature Scaling}
+
+cols <- colnames(house_df %>% select(-contains('.'), -c("median_house_value")))
+
+
+house_df_scaled <- cbind(house_df %>% select(cols) %>% normalize(), house_df %>% select(contains('.'), median_house_value))
+house_df_test_scaled <- cbind(house_df_test %>% select(cols) %>% normalize(), house_df_test %>% select(contains('.'), median_house_value))
+house_df_comp_scaled <- cbind(house_df_comp %>% select(cols) %>% normalize(), house_df_comp %>% select(contains('.')))
+
+house_df_scaled %>%
+  ggplot() + 
+  geom_density(aes(housing_median_age), color="red") +
+  geom_density(aes(total_rooms)) +
+  geom_density(aes(total_bedrooms)) +
+  geom_density(aes(population)) +
+  geom_density(aes(households)) +
+  geom_density(aes(median_income)) 
+```
+
+```{r, Select Variables}
+# 
+# bedrooms_rooms_ratio = total_bedrooms / total_rooms, 
+#      bedrooms_per_household = total_bedrooms / households, 
+#      rooms_per_household = total_rooms / households, 
+#      pop_per_household = population / households,
+#      bedrooms_pop_ratio = total_bedrooms / population, 
+#      extra_rooms_ratio = (total_rooms - total_bedrooms)/population
+
+house_df <- house_df %>% select(-c("total_rooms", "total_bedrooms", "extra_rooms_ratio", "bedrooms_pop_ratio", "pop_per_household"))
+house_df_scaled <- house_df_scaled %>% select(-c("total_rooms", "total_bedrooms", "extra_rooms_ratio", "bedrooms_pop_ratio", "pop_per_household"))
+
+house_df_test <- house_df_test %>% select(-c("total_rooms", "total_bedrooms", "extra_rooms_ratio", "bedrooms_pop_ratio", "pop_per_household"))
+house_df_test_scaled <- house_df_test_scaled %>% select(-c("total_rooms", "total_bedrooms", "extra_rooms_ratio", "bedrooms_pop_ratio", "pop_per_household"))
+
+
+```
+
+### Linear Model with Forward Selection (K-Folds)
+
+```{r, Simple Linear Model}
+data <- house_df_scaled %>% select(-c("longitude", "latitude"))
+lin_reg <- modelSelector(data, which(colnames(data) == "median_house_value"))
+
+summary(lin_reg)
+
+pred_test <- predict(lin_reg, newdata=house_df_test_scaled)
+rmse.lin_reg <- RMSE(pred_test, house_df_test$median_house_value)
+rmse.lin_reg
+linear <- list(rmse=rmse.lin_reg, name="Linear Model")
+```
+
+### Regularization (Cross-Validation)
+```{r}
+
+customControl<-trainControl(method = "repeatedcv", 
+                            number=10,
+                            repeats=5, 
+                            verboseIter = F)
+
+
+model <-train(median_house_value ~ ., 
+          house_df_scaled,
+          method="glmnet",
+          tuneGrid = expand.grid(alpha = 1, lambda = seq(0.0001, 100, length=40)),
+          trControl=customControl)
+
+model$results
+
+plot(model)
+model
+
+plot(model$finalModel, xvar="lambda", label = TRUE)
+plot(model$finalModel, xvar="dev", label = TRUE)
+plot(varImp(model, scale=T))
+coef(model$finalModel, s=model$bestTune$lambda)
+
+pred_test <- predict(model, newdata=house_df_test_scaled)
+rmse.lin_reg_lasso <- RMSE(pred_test, house_df_test$median_house_value)
+rmse.lin_reg_lasso 
+regul <- list(rmse=rmse.lin_reg_lasso, name="Lasso Regul")
+```
+
+```{r, Random Forest  Variables}
+library(randomForest)
+rf_model <- randomForest(formula = median_house_value ~ ., data=house_df, ntree=500, importance=TRUE)
+
+pred_test <- predict(rf_model, newdata=house_df_test)
+rmse.rf_lasso <- RMSE(pred_test, house_df_test$median_house_value)
+rmse.rf_lasso
+rf_lasso <- list( rmse=rmse.rf_lasso, name="RF 1")
+
+res <- predict(rf_model, newdata=house_df_comp)
+results <- data.frame(id=house_df_comp_ids$id,median_house_value = res)
+write_csv(results, file = "results-rf-lasso.csv", append = FALSE, col_names = TRUE)
+```
+
+```{r, Random Forest 2}
+rf_model_2 <- randomForest(formula = median_house_value ~ ., data=house_df_scaled, ntree=500, importance=TRUE)
+```
+
+
+```{r, RF 2 Results} 
+pred_test <- predict(rf_model_2, newdata=house_df_test_scaled)
+rmse.rf_lasso_scaled <- RMSE(pred_test, house_df_test_scaled$median_house_value)
+rmse.rf_lasso_scaled
+rf_lasso_scaled <- list(rmse=rmse.rf_lasso_scaled, "RF 2 Scaled")
+
+res <- predict(rf_model_2, newdata=house_df_comp_scaled)
+results <- data.frame(id=house_df_comp_ids$id,median_house_value = res)
+write_csv(results, file = "results-rf-lasso-scaled.csv", append = FALSE, col_names = TRUE)
+```
+
+```{r, Random Forest}
+library(h2o)
+library(bit64)
+h2o.no_progress()
+h2o.init(max_mem_size = "12g")
+
+y <- "median_house_value"
+x <- setdiff(names(house_df), y)
+train.h2o <- as.h2o(house_df)
+# hyperparameter grid
+hyper_grid.h2o <- list(
+  ntrees      = seq(10, 60, by=10),
+  mtries      = seq(3,16, by=2),
+  sample_rate = c(.632, .70)
+)
+
+grid <- h2o.grid(
+  algorithm = "randomForest",
+  grid_id = "rf_grid",
+  x = x,
+  y = y, 
+  training_frame = train.h2o,
+  hyper_params = hyper_grid.h2o,
+  search_criteria = list(strategy = "Cartesian")
+)
+
+grid_perf <- h2o.getGrid(
+  grid_id = "rf_grid", 
+  sort_by = "mse", 
+  decreasing = FALSE
+  )
+
+```
+
+
+```{r, RF h2o}
+print(grid_perf)
+
+checkRMSE <- function(model_id, objectives){
+  model <- h2o.getModel(model_id)
+  test.h2o <- as.h2o(objectives)
+  model_perf <- h2o.performance(model = model, newdata = test.h2o)
+  # RMSE of best model
+  rmse <- h2o.rmse(model_perf)
+  print(rmse)
+  rmse
+}
+best_model_id <- grid_perf@model_ids[[which.min(sapply(grid_perf@model_ids, function(model_id) checkRMSE(model_id, house_df_test)))]]
+best_model_rf <- h2o.getModel(best_model_id)
+
+data_test <- as.h2o(house_df_test)
+pred_test <- as.data.frame(predict(best_model_rf, newdata=data_test))
+rmse.rf <- RMSE(pred_test$predict, house_df_test$median_house_value)
+rmse.rf
+
+rf <- list(rmse=rmse.rf, name="RF")
+
+data_comp <- as.h2o(house_df_comp)
+res <- predict(best_model_rf, newdata=data_comp)
+
+
+res <- as.data.frame(res)
+results <- data.frame(id=house_df_comp_ids$id,median_house_value = res$predict)
+write_csv(results, file = "results-rf.csv", append = FALSE, col_names = TRUE)
+
+```
+
+```{r, Random Forest: Scaled}
+train.h2o <- as.h2o(house_df_scaled)
+# hyperparameter grid
+hyper_grid.h2o <- list(
+  ntrees      = seq(10, 60, by=10),
+  mtries      = seq(3,16, by=2),
+  sample_rate = c(.632, .70)
+)
+
+grid <- h2o.grid(
+  algorithm = "randomForest",
+  grid_id = "rf_grid_scaled",
+  x = x,
+  y = y, 
+  training_frame = train.h2o,
+  hyper_params = hyper_grid.h2o,
+  search_criteria = list(strategy = "Cartesian")
+)
+
+grid_perf <- h2o.getGrid(
+  grid_id = "rf_grid_scaled", 
+  sort_by = "mse", 
+  decreasing = FALSE
+  )
+
+```
+
+
+```{r, RF Scaled Results}
+print(grid_perf)
+
+best_model_id <- grid_perf@model_ids[[which.min(sapply(grid_perf@model_ids, function(model_id) checkRMSE(model_id, house_df_test_scaled)))]]
+best_model_rf_scaled <- h2o.getModel(best_model_id)
+
+data_test <- as.h2o(house_df_test_scaled)
+pred_test <- as.data.frame(predict(best_model_rf_scaled, newdata=data_test))
+rmse.rf_scaled <- RMSE(pred_test$predict, house_df_test_scaled$median_house_value)
+rmse.rf_scaled
+rf_scaled <- list(rmse=rmse.rf_scaled, name="RF Scaled")
+
+data_comp <- as.h2o(house_df_comp_scaled)
+res <- predict(best_model_rf_scaled, newdata=data_comp)
+res <- as.data.frame(res)
+results <- data.frame(id=house_df_comp_ids$id,median_house_value = res$predict)
+write_csv(results, file = "results-rf-scaled.csv", append = FALSE, col_names = TRUE)
+
+```
+
+```{r, Gradient Boost}
+# library(xgboost)
+# sample = sample.int(n = nrow(house_df), size = floor(.8*nrow(house_df)), replace = F)
+# 
+# train <- house_df[sample,]
+# valid <- house_df[-sample,]
+# 
+# train_x <- train %>% select(-c("median_house_value"))
+# train_y <- train %>% select("median_house_value")
+# valid_x <- valid %>% select(-c("median_house_value"))
+# valid_y <- valid %>% select("median_house_value")
+# test_x <- house_df_test %>% select(-c("median_house_value"))
+# test_y <- house_df_test %>% select("median_house_value")
+# 
+# dtrain <- xgb.DMatrix(data =  as.matrix(train_x), label = as.matrix(train_y))
+# dvalid <- xgb.DMatrix(data =  as.matrix(valid_x), label = as.matrix(valid_y))
+# dtest <- xgb.DMatrix(data =  as.matrix(test_x), label = as.matrix(test_y))
+# watchlist <- list(train=dtrain, test=dvalid)
+# 
+# 
+# max.depths <- c(7, 9)
+# etas <- c(0.01, 0.001)
+# 
+# best_params <- 0
+# best_score <- 0
+# 
+# count <- 1
+# for( depth in max.depths ){
+#     for( num in etas){
+# 
+#         bst_grid <- xgb.train(data = dtrain, 
+#                                 max.depth = depth, 
+#                                 eta=num, 
+#                                 nthread = 2, 
+#                                 nround = 10000, 
+#                                 watchlist = watchlist, 
+#                                 objective = "reg:squarederror", 
+#                                 early_stopping_rounds = 50, 
+#                                 verbose=0)
+# 
+#         if(count == 1){
+#             best_params <- bst_grid$params
+#             best_score <- bst_grid$best_score
+#             count <- count + 1
+#             }
+#         else if( bst_grid$best_score < best_score){
+#             best_params <- bst_grid$params
+#             best_score <- bst_grid$best_score
+#         }
+#     }
+# }
+# 
+# best_params
+# best_score
+
+
+```
+
+```{r, Tuned Gradient Boost}
+# gbm_tuned <- xgb.train(data = dtrain, 
+#                                 max.depth = best_params$max_depth, 
+#                                 eta=best_params$eta, 
+#                                 nthread = best_params$nthread, 
+#                                 nround = 10000, 
+#                                 watchlist = watchlist, 
+#                                 objective = "reg:squarederror", 
+#                                 early_stopping_rounds = 100, 
+#                                 verbose=0)
+# 
+# 
+# pred_test <- predict(gbm_tuned, newdata=dtest)
+# rmse.xgb <- RMSE(pred_test, house_df_test$median_house_value)
+# rmse.xgb
+# xgb <- list(rmse=rmse.xgb, name="XGB")
+# 
+# cols <- colnames(house_df %>% select(-c("median_house_value")))
+# 
+# dcomp = xgb.DMatrix(data =  as.matrix(house_df_comp %>% select(cols))) 
+# res <- predict(gbm_tuned, newdata=dcomp)
+# 
+# write_csv(data.frame(id=house_df_comp_ids$id,median_house_value = res), file = "results-gbm.csv", append = FALSE, col_names = TRUE)
+```
+
+```{r, Gradient Boost: Scaled}
+
+# train <- house_df_scaled[sample,]
+# valid <- house_df_scaled[-sample,]
+# train_x <- train %>% select(-c("median_house_value"))
+# train_y <- train %>% select("median_house_value")
+# valid_x <- valid %>% select(-c("median_house_value"))
+# valid_y <- valid %>% select("median_house_value")
+# test_x <- house_df_test_scaled %>% select(-c("median_house_value"))
+# test_y <- house_df_test_scaled %>% select("median_house_value")
+# 
+# dtrain <- xgb.DMatrix(data =  as.matrix(train_x), label = as.matrix(train_y))
+# dvalid <- xgb.DMatrix(data =  as.matrix(valid_x), label = as.matrix(valid_y))
+# dtest <- xgb.DMatrix(data =  as.matrix(test_x), label = as.matrix(test_y))
+# watchlist <- list(train=dtrain, test=dvalid)
+# 
+# 
+# max.depths <- c(7, 9)
+# etas <- c(0.01, 0.001)
+# 
+# best_params <- 0
+# best_score <- 0
+# 
+# count <- 1
+# for( depth in max.depths ){
+#     for( num in etas){
+# 
+#         bst_grid <- xgb.train(data = dtrain, 
+#                                 max.depth = depth, 
+#                                 eta=num, 
+#                                 nthread = 2, 
+#                                 nround = 10000, 
+#                                 watchlist = watchlist, 
+#                                 objective = "reg:squarederror", 
+#                                 early_stopping_rounds = 50, 
+#                                 verbose=0)
+# 
+#         if(count == 1){
+#             best_params <- bst_grid$params
+#             best_score <- bst_grid$best_score
+#             count <- count + 1
+#             }
+#         else if( bst_grid$best_score < best_score){
+#             best_params <- bst_grid$params
+#             best_score <- bst_grid$best_score
+#         }
+#     }
+# }
+# 
+# best_params
+# best_score
+
+```
+
+```{r, Tuned Gradient Boost Scaled}
+# gbm_tuned <- xgb.train(data = dtrain, 
+#                                 max.depth = best_params$max_depth, 
+#                                 eta=best_params$eta, 
+#                                 nthread = best_params$nthread, 
+#                                 nround = 10000, 
+#                                 watchlist = watchlist, 
+#                                 objective = "reg:squarederror", 
+#                                 early_stopping_rounds = 50, 
+#                                 verbose=0)
+# 
+# cols <- colnames(house_df %>% select(-c("median_house_value")))
+# 
+# pred_test <- predict(gbm_tuned, newdata=dtest)
+# rmse.xgb_scaled <- RMSE(pred_test, house_df_test$median_house_value)
+# rmse.xgb_scaled
+# xgb_scaled <- list(rmse=rmse.xgb_scaled, name="XGB Scaled")
+# 
+# dcomp = xgb.DMatrix(data =  as.matrix(house_df_comp_scaled %>% select(gbm_tuned$feature_names))) 
+# res <- predict(gbm_tuned, newdata=dcomp)
+# write_csv(data.frame(id=house_df_comp_ids$id,median_house_value = res), file = "results-gbm-scaled.csv", append = FALSE, col_names = TRUE)
+```
+```{r, CV XGB}
+
+train_x <- house_df_scaled %>% select(-c("median_house_value"))
+train_y <- house_df_scaled[,'median_house_value']
+test_x <- house_df_test_scaled %>% select(-c("median_house_value"))
+test_y <- house_df_test_scaled[,'median_house_value']
+
+# look up the model we are running to see the paramaters
+modelLookup("xgbLinear")
+ 
+# set up all the pairwise combinations
+
+xgb_grid_1 <- expand.grid(nrounds = c(1000,2000) ,
+                            eta = c(0.01, 0.001, 0.0001),
+                            lambda = seq(0.0001, 100, length=10),
+                            alpha = 0)
+xgb_grid_1
+
+
+#here we do one better then a validation set, we use cross validation to 
+#expand the amount of info we have!
+xgb_trcontrol_1 <- trainControl(method = "cv",
+                                number = 5,
+                                verboseIter = TRUE,
+                                returnData = FALSE,
+                                returnResamp = "all", 
+                                allowParallel = TRUE)
+
+xgb_train_cv <- train(x = as.matrix(train_x),
+                    y = train_y,
+                    trControl = xgb_trcontrol_1,
+                    tuneGrid = xgb_grid_1,
+                    method = "xgbLinear",
+                    max.depth = 5)
+
+```
+
+```{r, XGB Train Result}
+names(xgb_train_cv)
+xgb_train_cv$bestTune
+xgb_train_cv$method
+summary(xgb_train_cv)
+
+xgb_cv_pred <- predict(xgb_train_cv , as.matrix(test_x))
+
+
+test_rmse <- RMSE(xgb_cv_pred, test_y)
+test_rmse
+xgb_cv_scaled <- list(rmse=test_rmse, name="XGB CV Scaled")
+
+x <- as.matrix(house_df_comp_scaled)
+res <- predict(xgb_train_cv, newdata=x)
+write_csv(data.frame(id=house_df_comp_ids$id,median_house_value = res), file = "results-xgb-cv.csv", append = FALSE, col_names = TRUE)
+```
+```{r, Ensemble 1}
+# xgb cv scaled, rf scaled
+
+predict_ensemble_1 <- function(newdata){
+  data_comp <- as.h2o(newdata)
+  res <- as.data.frame(predict(best_model_rf_scaled, newdata=data_comp))
+  xgb_cv_pred <- predict(xgb_train_cv , as.matrix(newdata))
+  result <- 0.5 * xgb_cv_pred + 0.5 * res$predict
+  return(result)
+}
+
+
+rmse.ensemble_xgb_rf <- RMSE(predict_ensemble_1(house_df_test_scaled), house_df_test_scaled$median_house_value)
+ensemble_1 <- list(rmse=rmse.ensemble_xgb_rf, name="Ensemble Scaled")
+
+result <- predict_ensemble_1(house_df_comp_scaled)
+
+write_csv(data.frame(id=house_df_comp_ids$id,median_house_value = result), file = "results-ensemble.csv", append = FALSE, col_names = TRUE)
+```
+
+```{r, SVM}
+
+library(e1071)
+
+svm_tunning <- tune(svm, median_house_value ~ median_income + households + population + latitude + longitude + ocean_proximity.INLAND + bedrooms_rooms_ratio + housing_median_age + rooms_per_household + ocean_proximity.NEAR.BAY, data=house_df_scaled,ranges=list(elsilon=seq(0,1,0.1), cost=5))
+
+model_svm <- svm_tunning$best.model
+
+```
+
+
+```{r, SVM Results} 
+rmse.svm <- RMSE(predict(model_svm, newdata=house_df_test_scaled), house_df_test_scaled$median_house_value)
+svm_scaled <- list(rmse=rmse.svm, name="SVM Scaled")
+
+
+result <- predict(model_svm, newdata=house_df_comp_scaled)
+
+write_csv(data.frame(id=house_df_comp_ids$id,median_house_value = result), file = "results-svm.csv", append = FALSE, col_names = TRUE)
+
+```
+
+
+```{r, Ensemble 2}
+# xgb cv scaled, rf scaled
+
+predict_ensemble_2 <- function(newdata){
+  data_comp <- as.h2o(newdata)
+  res <- as.data.frame(predict(best_model_rf_scaled, newdata=data_comp))
+  xgb_cv_pred <- predict(xgb_train_cv , as.matrix(newdata))
+  svm_pred = predict(model_svm, newdata=newdata)
+  lasso_pred = predict(model, newdata=newdata)
+  result <- 0.25 * xgb_cv_pred + 0.25 * res$predict + 0.25 * svm_pred + 0.25 * lasso_pred
+  return(result)
+}
+
+
+rmse.ensemble_xgb_rf_svm <- RMSE(predict_ensemble_2(house_df_test_scaled), house_df_test_scaled$median_house_value)
+ensemble_2 <- list(rmse=rmse.ensemble_xgb_rf_svm, name="Ensemble Scaled")
+
+result <- predict_ensemble_2(house_df_comp_scaled)
+
+write_csv(data.frame(id=house_df_comp_ids$id,median_house_value = result), file = "results-ensemble-2.csv", append = FALSE, col_names = TRUE)
+```
+
+```{r, AutoML, eval=FALSE}
+library(xgboost)
+y <- "median_house_value"
+x <- setdiff(names(house_df_scaled), y)
+train.h2o <- as.h2o(house_df_scaled)
+auto_ml <- h2o.automl(
+  x = x, y = y, training_frame = train.h2o, nfolds = 5, 
+  max_runtime_secs = 60 * 120, max_models = 50,
+  keep_cross_validation_predictions = TRUE, sort_metric = "RMSE", seed = 123,
+  stopping_rounds = 50, stopping_metric = "RMSE", stopping_tolerance = 0
+)
+
+
+```
+```{r, AutoML Results, eval=FALSE}
+auto_ml@leaderboard %>% 
+  as.data.frame() %>%
+  dplyr::select(model_id, rmse) %>%
+  dplyr::slice(1:25)
+
+data_test <- as.h2o(house_df_test_scaled)
+pred_test <- as.data.frame(predict(auto_ml@leader, newdata=data_test))
+rmse.automl <- RMSE(pred_test$predict, house_df_test$median_house_value)
+rmse.automl
+
+res_autom_ml <- list(rmse=rmse.automl, name="AutoML")
+
+data_comp <- as.h2o(house_df_comp_scaled)
+res <- predict(auto_ml@leader, newdata=data_comp)
+
+
+res <- as.data.frame(res)
+results <- data.frame(id=house_df_comp_ids$id,median_house_value = res$predict)
+write_csv(results, file = "results-automl.csv", append = FALSE, col_names = TRUE)
+
+```
+```{r, Results}
+
+# rbind(linear, regul, rf, rf_scaled, rf_lasso, rf_lasso_scaled, xgb, xgb_scaled,xgb_cv_scaled, svm_scaled, ensemble_1)
+rbind(linear, regul, rf, rf_scaled, rf_lasso, rf_lasso_scaled,xgb_cv_scaled, svm_scaled, ensemble_1, ensemble_2)
+
+```
+
+![Results](./results/results.png)
